@@ -129,7 +129,7 @@ def generate_reply(state, frames, evaluation_method, look_ahead, sess, nodes):
                     state["nattempts"] = 0
                     if state["frame_index"] == len(frames):
                         outfile.write("Ed: " + done_message)
-                        exit()
+                        return
                     if state["questions_remaining"] > 0:
                         state["questions_remaining"] -= 1
                         json.dump(state, open("state.json", "w"))
