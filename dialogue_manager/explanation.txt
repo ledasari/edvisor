@@ -1,0 +1,7 @@
+Original Patient Answer: metformin
+Original Reference Answer: Metformin
+Processed Patient Answer: metformin
+Processed Reference Answer: metformin
+Match Level: 1(100.0%)
+Matching Words:
+metformin--metformin: metformin, Glucophage

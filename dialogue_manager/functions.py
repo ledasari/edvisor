@@ -6,6 +6,7 @@ from input_helpers import InputHelper
 from nltk.stem.porter import *
 import string
 from nltk.corpus import stopwords
+from nltk.corpus import wordnet as wn
 
 # Constants
 welcome_message = "Hello and welcome to Health EdVisor. My name is Ed and I will be walking you through your medication " \
@@ -19,12 +20,67 @@ next_question_message = "Let's move on to the next question."
 exit_message = "Seems like you're tired. Let's take this up another time."
 skip_message = "Okay, let's skip this question."
 done_message = "That brings us to the end of our session. Thank you for your participation!"
+no_evaluation_message = "Thank you for your answer!"
 
 vocab_filepath = "../model/checkpoints/vocab"
 batch_size = 64
 
 stemmer = PorterStemmer()
 stopwords_english = stopwords.words('english')
+
+def get_synonyms(word):
+    synonyms = [word]
+    for syn in wn.synsets(word):
+        for lemma in syn.lemmas():
+            synonyms.append(lemma.name())
+    return list(set(synonyms))
+
+def expand_word_list(word_list):
+    return {word: get_synonyms(word) for word in word_list}
+
+def explain_evaluation(patient_answer, reference_answer, original_patient_answer, original_reference_answer, matches):
+    with open("explanation.txt", "w") as outfile:
+        outfile.write("Original Patient Answer: " + original_patient_answer + "\n")
+        outfile.write("Original Reference Answer: " + original_reference_answer + "\n")
+        outfile.write("Processed Patient Answer: " + " ".join(patient_answer) + "\n")
+        outfile.write("Processed Reference Answer: " + " ".join(reference_answer) + "\n")
+        outfile.write("Match Level: " + str(len(matches)) + "(" + str(100*float(len(matches))/len(reference_answer)) + "%)\n")
+        outfile.write("Matching Words:\n")
+        for match in matches:
+            outfile.write(match[0] + "--" + match[1] + ": " + ", ".join(match[2]) + "\n")
+    return
+
+
+def lexical_overlap_with_synonymy(patient_answers, reference_answers, original_patient_answers, original_reference_answers, threshold = 0.5):
+
+    best_match = 0.0
+    best_matches = []
+    best_patient_ind = -1
+    best_reference_ind = -1
+
+    for i, patient_answer in enumerate(patient_answers):
+        patient_answer = patient_answer.split()
+        patient_answer_syns = expand_word_list(patient_answer)
+        for j, reference_answer in enumerate(reference_answers):
+            matches = []
+            reference_answer = reference_answer.split()
+            reference_answer_syns = expand_word_list(reference_answer)
+            for word_reference in reference_answer:
+                for word_patient in patient_answer:
+                    intersection = set(patient_answer_syns[word_patient]) & set(reference_answer_syns[word_reference])
+                    if len(intersection) > 0:
+                        matches.append((word_patient, word_reference, intersection))
+                        break
+            if float(len(matches))/len(reference_answer) >= threshold:
+                explain_evaluation(patient_answer, reference_answer, original_patient_answers[i], original_reference_answers[j], matches)
+                return True
+            if float(len(matches)) / len(reference_answer) >= best_match:
+                best_match = float(len(matches)) / len(reference_answer)
+                best_matches = matches
+                best_patient_ind = i
+                best_reference_ind = j
+    explain_evaluation(patient_answers[best_patient_ind].split(), reference_answers[best_reference_ind].split(), original_patient_answers[best_patient_ind], original_reference_answers[best_reference_ind], best_matches)
+    return False
 
 def lexical_overlap(patient_answers, reference_answers, threshold = 0.5):
     for patient_answer in patient_answers:
@@ -62,10 +118,13 @@ def siamese_network(patient_answers, reference_answers, sess, nodes):
     return False
 
 
-def evaluate_answer(reference_answers, evaluation_method, sess, nodes, lowercase = True, tokenize = True, stem = True, remove_stop_words = True):
+def evaluate_answer(reference_answers, evaluation_method, sess, nodes, lowercase = True, tokenize = True, stem = False, remove_stop_words = True):
     patient_answers = [x.strip() for x in open("infile.txt").read().strip().split("\n")]
+    original_patient_answers = [x for x in patient_answers]
     patient_answers = [x.translate(None, string.punctuation) for x in patient_answers]
-    reference_answers = [x.translate(None, string.punctuation) for x in reference_answers]
+    original_reference_answers = [str(x) for x in reference_answers]
+    reference_answers = [str(x).translate(None, string.punctuation) for x in reference_answers]
+
     if lowercase:
         patient_answers = [x.lower() for x in patient_answers]
         reference_answers = [x.lower() for x in reference_answers]
@@ -84,28 +143,95 @@ def evaluate_answer(reference_answers, evaluation_method, sess, nodes, lowercase
     elif evaluation_method == "lexical_overlap":
         if lexical_overlap(patient_answers, reference_answers):
             return True
+    elif evaluation_method == "lexical_overlap_w_synonymy":
+        if lexical_overlap_with_synonymy(patient_answers, reference_answers, original_patient_answers, original_reference_answers):
+            return True
     elif evaluation_method == "siamese_network":
         if siamese_network(patient_answers, reference_answers, sess, nodes):
             return True
     return False
 
 
-def generate_reply(state, frames, evaluation_method, look_ahead, sess, nodes):
-    if open("infile.txt").read().strip() == "start":
-        with open("outfile.txt", "w") as outfile:
-            outfile.write("Ed: " + welcome_message + "\n")
-            for i in range(look_ahead[0]):
-                outfile.write("Ed: " + frames[i].statement + "\n")
-            outfile.write("Ed: " + frames[0].question + "\n")
-            state = {"frame_index": 0, "nattempts": 0, "questions_remaining": look_ahead[0]-1}
-            json.dump(state, open("state.json", "w"))
-    else:
-        with open("outfile.txt", "w") as outfile:
-            if evaluate_answer(frames[state["frame_index"]].answer, evaluation_method, sess, nodes):
-                outfile.write("Ed: " + right_answer_message + "\n")
+def generate_reply(state, frames, evaluation_method, look_ahead, sess, nodes, mode):
+    if mode == "teachback":
+        if open("infile.txt").read().strip() == "start":
+            with open("outfile.txt", "w") as outfile:
+                outfile.write("Ed: " + welcome_message + "\n")
+                for i in range(look_ahead[0]):
+                    outfile.write("Ed: " + frames[i].statement + "\n")
+                outfile.write("Ed: " + frames[0].question + "\n")
+                state = {"frame_index": 0, "nattempts": 0, "questions_remaining": look_ahead[0]-1}
+                json.dump(state, open("state.json", "w"))
+        else:
+            with open("outfile.txt", "w") as outfile:
+                if evaluate_answer(frames[state["frame_index"]].answer, evaluation_method, sess, nodes):
+                    outfile.write("Ed: " + right_answer_message + "\n")
+                    state["frame_index"] += 1
+                    state["nattempts"] = 0
+                    if state["frame_index"] == len(frames):
+                        outfile.write("Ed: " + done_message)
+                        return
+                    if state["questions_remaining"] > 0:
+                        state["questions_remaining"] -= 1
+                        json.dump(state, open("state.json", "w"))
+                        outfile.write("Ed: " + next_question_message + "\n")
+                        outfile.write("Ed: " + frames[state["frame_index"]].question)
+                    else:
+                        outfile.write("Ed: " + next_statement_message + "\n")
+                        state["questions_remaining"] = look_ahead[state["frame_index"]] - 1
+                        json.dump(state, open("state.json", "w"))
+                        for i in range(look_ahead[state["frame_index"]]):
+                            outfile.write("Ed: " + frames[state["frame_index"] + i].statement + "\n")
+                        outfile.write("Ed: " + frames[state["frame_index"]].question + "\n")
+                else:
+                    state["nattempts"] += 1
+                    if state["nattempts"] == 2:
+                        outfile.write("Ed: " + skip_message + "\n")
+                        state["frame_index"] += 1
+                        state["nattempts"] = 0
+                        if state["frame_index"] == len(frames):
+                            outfile.write("Ed: " + done_message)
+                            return
+                        if state["questions_remaining"] > 0:
+                            state["questions_remaining"] -= 1
+                            json.dump(state, open("state.json", "w"))
+                            outfile.write("Ed: " + next_question_message + "\n")
+                            outfile.write("Ed: " + frames[state["frame_index"]].question)
+                        else:
+                            state["questions_remaining"] = look_ahead[state["frame_index"]] - 1
+                            json.dump(state, open("state.json", "w"))
+                            outfile.write("Ed: " + next_statement_message + "\n")
+                            for i in range(look_ahead[state["frame_index"]]):
+                                outfile.write("Ed: " + frames[state["frame_index"] + i].statement + "\n")
+                            outfile.write("Ed: " + frames[state["frame_index"]].question + "\n")
+                    else:
+                        json.dump(state, open("state.json", "w"))
+                        outfile.write("Ed: " + wrong_answer_message + "\n")
+                        outfile.write("Ed: " + frames[state["frame_index"]].statement + "\n")
+                        outfile.write("Ed: " + frames[state["frame_index"]].question + "\n")
+
+    elif mode == "no_questions":
+        if open("infile.txt").read().strip() == "start":
+            with open("outfile.txt", "w") as outfile:
+                outfile.write("Ed: " + welcome_message + "\n")
+                for i in range(len(frames)):
+                    outfile.write("Ed: " + frames[i].statement + "\n")
+                outfile.write("Ed: " + done_message)
+
+    elif mode == "no_evaluation":
+        if open("infile.txt").read().strip() == "start":
+            with open("outfile.txt", "w") as outfile:
+                outfile.write("Ed: " + welcome_message + "\n")
+                for i in range(look_ahead[0]):
+                    outfile.write("Ed: " + frames[i].statement + "\n")
+                outfile.write("Ed: " + frames[0].question + "\n")
+                state = {"frame_index": 0, "nattempts": 0, "questions_remaining": look_ahead[0]-1}
+                json.dump(state, open("state.json", "w"))
+        else:
+            with open("outfile.txt", "w") as outfile:
+                outfile.write("Ed: " + no_evaluation_message + "\n")
                 state["frame_index"] += 1
                 state["nattempts"] = 0
-                print state["questions_remaining"]
                 if state["frame_index"] == len(frames):
                     outfile.write("Ed: " + done_message)
                     return
@@ -121,29 +247,4 @@ def generate_reply(state, frames, evaluation_method, look_ahead, sess, nodes):
                     for i in range(look_ahead[state["frame_index"]]):
                         outfile.write("Ed: " + frames[state["frame_index"] + i].statement + "\n")
                     outfile.write("Ed: " + frames[state["frame_index"]].question + "\n")
-            else:
-                state["nattempts"] += 1
-                if state["nattempts"] == 2:
-                    outfile.write("Ed: " + skip_message + "\n")
-                    state["frame_index"] += 1
-                    state["nattempts"] = 0
-                    if state["frame_index"] == len(frames):
-                        outfile.write("Ed: " + done_message)
-                        return
-                    if state["questions_remaining"] > 0:
-                        state["questions_remaining"] -= 1
-                        json.dump(state, open("state.json", "w"))
-                        outfile.write("Ed: " + next_question_message + "\n")
-                        outfile.write("Ed: " + frames[state["frame_index"]].question)
-                    else:
-                        state["questions_remaining"] = look_ahead[state["frame_index"]] - 1
-                        json.dump(state, open("state.json", "w"))
-                        outfile.write("Ed: " + next_statement_message + "\n")
-                        for i in range(look_ahead[state["frame_index"]]):
-                            outfile.write("Ed: " + frames[state["frame_index"] + i].statement + "\n")
-                        outfile.write("Ed: " + frames[state["frame_index"]].question + "\n")
-                else:
-                    json.dump(state, open("state.json", "w"))
-                    outfile.write("Ed: " + wrong_answer_message + "\n")
-                    outfile.write("Ed: " + frames[state["frame_index"]].statement + "\n")
-                    outfile.write("Ed: " + frames[state["frame_index"]].question + "\n")
+
